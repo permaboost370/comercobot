@@ -1,15 +1,14 @@
 import os, asyncio, time, random
-from typing import List, Optional
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ChatType
-from aiogram.enums import ParseMode
+from aiogram.types import Message
+from aiogram.enums import ParseMode, ChatType, MessageEntityType
 from aiogram.filters import Command, CommandStart
 from dotenv import load_dotenv
 
 import aiosqlite
 from openai import OpenAI, RateLimitError, APIError
-
 
 # ---------- Load environment ----------
 load_dotenv()
@@ -33,7 +32,6 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 dp = Dispatcher()
 
-
 # ---------- Memory Layer (SQLite) ----------
 INIT_SQL = """
 CREATE TABLE IF NOT EXISTS messages(
@@ -55,7 +53,6 @@ CREATE TABLE IF NOT EXISTS summaries(
 );
 CREATE INDEX IF NOT EXISTS idx_summaries_chat_ts ON summaries(chat_id, ts);
 """
-
 
 class Memory:
     def __init__(self, db_path: str):
@@ -115,16 +112,13 @@ class Memory:
             )
         return row[0] if row else 0
 
-
 memory = Memory(MEMORY_DB)
-
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant in a Telegram GROUP. "
     "Use the provided memory summary + recent messages to stay consistent with names, preferences, and decisions. "
     "Be concise unless asked for detail."
 )
-
 
 # ---------- OpenAI helpers ----------
 async def llm_reply(user_text: str, system_prompt: Optional[str], context: Optional[str]) -> str:
@@ -142,7 +136,7 @@ async def llm_reply(user_text: str, system_prompt: Optional[str], context: Optio
                 model=OPENAI_MODEL,
                 messages=messages,
             )
-            return response.choices[0].message.content.strip()
+            return (response.choices[0].message.content or "").strip()
         except (RateLimitError, APIError):
             if attempt == 5:
                 raise
@@ -155,7 +149,6 @@ async def llm_reply(user_text: str, system_prompt: Optional[str], context: Optio
             await asyncio.sleep(1.2)
     return "(no response)"
 
-
 # ---------- Utility ----------
 async def build_context(chat_id: str) -> str:
     summary = await memory.get_latest_summary(chat_id)
@@ -163,7 +156,6 @@ async def build_context(chat_id: str) -> str:
     if summary and recent:
         return f"{summary}\n--- Recent:\n{recent}"
     return summary or recent or ""
-
 
 async def maybe_summarize(chat_id: str):
     count = await memory.count_messages(chat_id)
@@ -182,7 +174,6 @@ async def maybe_summarize(chat_id: str):
         except Exception:
             pass
 
-
 # ---------- Commands ----------
 @dp.message(CommandStart())
 async def on_start(msg: Message):
@@ -193,14 +184,12 @@ async def on_start(msg: Message):
         "Admins: /memory to view, /wipe to delete stored memory for this chat."
     )
 
-
 @dp.message(Command("memory"))
 async def on_memory(msg: Message):
     chat_id = str(msg.chat.id)
     context = await build_context(chat_id)
     preview = context[:2000] if context else "(no memory yet)"
     await msg.answer(f"Current memory preview:\n\n{preview}")
-
 
 @dp.message(Command("wipe"))
 async def on_wipe(msg: Message):
@@ -210,7 +199,6 @@ async def on_wipe(msg: Message):
         await db.execute("DELETE FROM summaries WHERE chat_id=?", (chat_id,))
         await db.commit()
     await msg.answer("Memory wiped for this chat.")
-
 
 # ---------- Text Handler ----------
 @dp.message(F.text & (F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE})))
@@ -230,13 +218,18 @@ async def on_text(msg: Message):
     mentioned = False
     if msg.entities:
         for e in msg.entities:
-            if getattr(e, "type", "") == "mention":
+            if getattr(e, "type", None) == MessageEntityType.MENTION:
                 mentioned = True
                 break
     if self_user and (f"@{self_user.username}" in text):
         mentioned = True
 
-    is_reply_to_me = msg.reply_to_message and msg.reply_to_message.from_user and self_user and msg.reply_to_message.from_user.id == self_user.id
+    is_reply_to_me = (
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and self_user
+        and msg.reply_to_message.from_user.id == self_user.id
+    )
 
     should_reply = is_private or mentioned or is_reply_to_me
     if not should_reply:
@@ -256,13 +249,11 @@ async def on_text(msg: Message):
 
     await maybe_summarize(chat_id)
 
-
 # ---------- Entry ----------
 async def main():
     await memory.init()
     print("Bot is running (polling).")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
