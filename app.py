@@ -1,5 +1,6 @@
 import os
 import logging
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -20,6 +21,9 @@ load_dotenv(override=False)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.7"))
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "6"))  # how many back-and-forths to keep
+
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL")  # e.g. https://<your-app>.up.railway.app
 PORT = int(os.getenv("PORT", "8000"))
@@ -48,29 +52,46 @@ dp.include_router(router)
 # -----------------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Per-chat rolling memory: { chat_id: deque([{"role":"user"/"assistant","content":...}, ...]) }
+histories = defaultdict(lambda: deque(maxlen=2 * MAX_TURNS))
+
 # System prompt to make the bot a top agronomist / γεωπόνος
 SYSTEM_PROMPT = (
     "You are an elite agronomist (γεωπόνος) and crop specialist. "
-    "You have deep expertise across field crops, orchards, vineyards, vegetables, greenhouses, hydroponics, and specialty crops. "
-    "You are an expert in plant nutrition & fertilization (macro/micro nutrients, deficiency symptoms, tissue/soil tests), "
-    "irrigation scheduling, soil science, IPM (integrated pest management), and the diagnosis and control of diseases & pests. "
-    "Give accurate, practical, step-by-step guidance. When relevant, include ranges, rates, timings, phenological stages, thresholds, "
-    "and scouting/monitoring methods. Prefer active substances and IPM strategies over brand names. "
-    "Flag regulatory/safety constraints and advise consulting local regulations/labels. "
-    "Default to Greek in your answers unless the user clearly asks for English."
+    "Be friendly, clear, and structured like ChatGPT. Ask clarifying questions when needed, "
+    "and keep answers practical and concise, with numbered steps or bullets where helpful. "
+    "Expertise: plant nutrition & fertilization (macro/micro), irrigation, soil science, IPM, "
+    "diagnosis & control of diseases and pests, scouting thresholds, and timing by phenological stage. "
+    "Prefer active substances and IPM strategies over brand names; flag local regulations & label compliance. "
+    "Default language: Greek unless the user clearly requests English."
 )
 
-async def ask_llm(user_prompt: str) -> str:
-    """Call OpenAI Responses API and return plain text output with agronomist persona."""
+async def ask_llm(chat_id: int, user_prompt: str) -> str:
+    """
+    Call OpenAI Responses API with a ChatGPT-like conversational format
+    and per-chat rolling memory.
+    """
     try:
+        # Build message list: system + (history) + new user
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(list(histories[chat_id]))  # user/assistant alternating
+        messages.append({"role": "user", "content": user_prompt})
+
         resp = client.responses.create(
             model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            input=messages,                   # responses API accepts role-based list via 'input'
+            temperature=OPENAI_TEMPERATURE,  # conversational tone
+            max_output_tokens=800,           # enough room for practical guidance
+            top_p=1,
         )
-        return resp.output_text.strip()
+
+        answer = resp.output_text.strip()
+
+        # Update memory
+        histories[chat_id].append({"role": "user", "content": user_prompt})
+        histories[chat_id].append({"role": "assistant", "content": answer})
+
+        return answer
     except Exception as e:
         log.exception("OpenAI error")
         return f"⚠️ Σφάλμα AI: {e}"
@@ -80,10 +101,12 @@ async def ask_llm(user_prompt: str) -> str:
 # -----------------------------
 @router.message(Command("start"))
 async def on_start_cmd(message: Message):
+    # Clear chat memory on new start for a fresh session
+    histories.pop(message.chat.id, None)
     log.info(f"/start from {message.from_user.id} @{message.from_user.username}")
     await message.answer(
         "👋 Καλώς ήρθες! Είμαι ο γεωπόνος σου.\n"
-        "Στείλε <code>/ai την ερώτησή σου</code> και θα απαντήσω.\n"
+        "Στείλε <code>/ai την ερώτησή σου</code> και θα απαντήσω σαν κορυφαίος ειδικός.\n"
         "Παράδειγμα: <code>/ai Πρόγραμμα λίπανσης για ντομάτα θερμοκηπίου;</code>"
     )
 
@@ -95,9 +118,11 @@ async def on_ai(message: Message, command: CommandObject):
             "<code>/ai Συμπτώματα έλλειψης μαγνησίου στην ελιά;</code>"
         )
         return
+
     await message.chat.do("typing")
+    chat_id = message.chat.id
     log.info(f"/ai from {message.from_user.id} @{message.from_user.username}: {command.args}")
-    answer = await ask_llm(command.args)
+    answer = await ask_llm(chat_id, command.args)
     await message.answer(answer)
 
 # -----------------------------
@@ -107,7 +132,13 @@ app = FastAPI()
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "port": PORT, "model": OPENAI_MODEL}
+    return {
+        "status": "ok",
+        "port": PORT,
+        "model": OPENAI_MODEL,
+        "temperature": OPENAI_TEMPERATURE,
+        "max_turns": MAX_TURNS,
+    }
 
 # Use only the numeric part of the token in the URL path
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN.split(':', 1)[0]}"
