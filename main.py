@@ -1,12 +1,13 @@
 import os, asyncio, time, random
 from typing import Optional
 
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import Message, Update
 from aiogram.enums import ParseMode, ChatType, MessageEntityType
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.client.default import DefaultBotProperties
-from dotenv import load_dotenv
 
 import aiosqlite
 from openai import OpenAI, RateLimitError, APIError
@@ -23,19 +24,28 @@ MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "4096"))
 RECENT_CHARS = int(os.getenv("RECENT_CHARS", "6000"))
 SUMMARY_EVERY_N_MESSAGES = int(os.getenv("SUMMARY_EVERY_N_MESSAGES", "80"))
 
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://app.up.railway.app/webhook/abc123
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # random secret header token
+
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL missing")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# aiogram v3.7+ style default props
+# aiogram v3.7+ default parse mode
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
 )
 dp = Dispatcher()
+
+app = FastAPI(title="Telegram Webhook Bot")
 
 # ---------- Memory Layer (SQLite) ----------
 INIT_SQL = """
@@ -154,7 +164,7 @@ async def llm_reply(user_text: str, system_prompt: Optional[str], context: Optio
             await asyncio.sleep(1.2)
     return "(no response)"
 
-# ---------- Utility ----------
+# ---------- Utilities ----------
 async def build_context(chat_id: str) -> str:
     summary = await memory.get_latest_summary(chat_id)
     recent = await memory.get_recent_text(chat_id, limit_chars=RECENT_CHARS)
@@ -165,7 +175,6 @@ async def build_context(chat_id: str) -> str:
 async def maybe_summarize(chat_id: str):
     count = await memory.count_messages(chat_id)
     if count > 0 and count % SUMMARY_EVERY_N_MESSAGES == 0:
-        # FIXED: second argument is 16000 (not "16*")
         long_context = await memory.get_recent_text(chat_id, limit_chars=max(RECENT_CHARS * 3, 16000))
         try:
             summary_text = await llm_reply(
@@ -207,14 +216,12 @@ async def on_wipe(msg: Message):
         await db.commit()
     await msg.answer("Memory wiped for this chat.")
 
-# NEW: /ai command
 @dp.message(Command("ai"))
 async def on_ai(msg: Message, command: CommandObject):
     chat_id = str(msg.chat.id)
     user_id = str(msg.from_user.id) if msg.from_user else None
     username = msg.from_user.username if msg.from_user else None
 
-    # Take args after /ai, or the text of the replied message if empty
     prompt = (command.args or "").strip() if command else ""
     if not prompt and msg.reply_to_message and msg.reply_to_message.text:
         prompt = msg.reply_to_message.text.strip()
@@ -223,7 +230,6 @@ async def on_ai(msg: Message, command: CommandObject):
         await msg.answer("Usage: `/ai your prompt` or reply to a message with `/ai`.")
         return
 
-    # Store the /ai invocation for memory
     await memory.add_message(chat_id, user_id, username, "user", f"/ai {prompt}")
 
     context = await build_context(chat_id)
@@ -241,7 +247,7 @@ async def on_ai(msg: Message, command: CommandObject):
 
     await maybe_summarize(chat_id)
 
-# ---------- Fallback text handler (mentions / replies) ----------
+# Optional fallback: mentions/replies (keeps memory fresh even if we don't respond)
 @dp.message(F.text & (F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE})))
 async def on_text(msg: Message):
     chat_id = str(msg.chat.id)
@@ -249,10 +255,10 @@ async def on_text(msg: Message):
     username = msg.from_user.username if msg.from_user else None
     text = (msg.text or "").strip()
 
-    # Store all messages
+    # Always store for memory
     await memory.add_message(chat_id, user_id, username, "user", text)
 
-    # Decide whether to reply automatically
+    # Only auto-reply in DMs, mentions, or replies-to-me
     self_user = await bot.me()
     is_private = msg.chat.type == ChatType.PRIVATE
 
@@ -290,11 +296,33 @@ async def on_text(msg: Message):
 
     await maybe_summarize(chat_id)
 
-# ---------- Entry ----------
-async def main():
-    await memory.init()
-    print("Bot is running (polling).")
-    await dp.start_polling(bot)
+# ---------- FastAPI webhook endpoint ----------
+@app.post("/webhook/{path_token}")
+async def telegram_webhook(request: Request, path_token: str):
+    # Verify Telegram secret header (optional but recommended)
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if header_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    data = await request.json()
+    update = Update.model_validate(data)  # pydantic v2
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+# ---------- FastAPI lifecycle ----------
+@app.on_event("startup")
+async def on_app_startup():
+    await memory.init()
+    # Set webhook on startup (idempotent). Drop pending to avoid backlog.
+    await bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=["message"]
+    )
+
+@app.on_event("shutdown")
+async def on_app_shutdown():
+    # Optional: keep webhook set. If you want to remove it on shutdown:
+    # await bot.delete_webhook(drop_pending_updates=False)
+    pass
