@@ -165,4 +165,136 @@ async def build_context(chat_id: str) -> str:
 async def maybe_summarize(chat_id: str):
     count = await memory.count_messages(chat_id)
     if count > 0 and count % SUMMARY_EVERY_N_MESSAGES == 0:
-        long_context = await memory.get_recent_text(chat_id, limit_chars=max(RECENT_CHARS * 3, 16*
+        # FIXED: second argument is 16000 (not "16*")
+        long_context = await memory.get_recent_text(chat_id, limit_chars=max(RECENT_CHARS * 3, 16000))
+        try:
+            summary_text = await llm_reply(
+                user_text=long_context,
+                system_prompt=(
+                    "Summarize the group conversation into durable notes: participants, preferences, decisions, tasks, links, and stable facts. "
+                    "Keep it under 600 words. Update/merge rather than repeat."
+                ),
+                context=None,
+            )
+            await memory.save_summary(chat_id, summary_text)
+        except Exception:
+            pass
+
+# ---------- Commands ----------
+@dp.message(CommandStart())
+async def on_start(msg: Message):
+    await memory.add_message(str(msg.chat.id), str(msg.from_user.id), msg.from_user.username, "user", msg.text or "")
+    await msg.answer(
+        "Hi! I’m alive in this chat. I remember context across messages.\n"
+        "In groups, mention me or reply to me when you want an answer.\n"
+        "Or use /ai <prompt> (or reply to a message with /ai).\n"
+        "Admins: /memory to view, /wipe to delete stored memory for this chat."
+    )
+
+@dp.message(Command("memory"))
+async def on_memory(msg: Message):
+    chat_id = str(msg.chat.id)
+    context = await build_context(chat_id)
+    preview = context[:2000] if context else "(no memory yet)"
+    await msg.answer(f"Current memory preview:\n\n{preview}")
+
+@dp.message(Command("wipe"))
+async def on_wipe(msg: Message):
+    chat_id = str(msg.chat.id)
+    async with aiosqlite.connect(MEMORY_DB) as db:
+        await db.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+        await db.execute("DELETE FROM summaries WHERE chat_id=?", (chat_id,))
+        await db.commit()
+    await msg.answer("Memory wiped for this chat.")
+
+# NEW: /ai command
+@dp.message(Command("ai"))
+async def on_ai(msg: Message, command: CommandObject):
+    chat_id = str(msg.chat.id)
+    user_id = str(msg.from_user.id) if msg.from_user else None
+    username = msg.from_user.username if msg.from_user else None
+
+    # Take args after /ai, or the text of the replied message if empty
+    prompt = (command.args or "").strip() if command else ""
+    if not prompt and msg.reply_to_message and msg.reply_to_message.text:
+        prompt = msg.reply_to_message.text.strip()
+
+    if not prompt:
+        await msg.answer("Usage: `/ai your prompt` or reply to a message with `/ai`.")
+        return
+
+    # Store the /ai invocation for memory
+    await memory.add_message(chat_id, user_id, username, "user", f"/ai {prompt}")
+
+    context = await build_context(chat_id)
+    try:
+        reply = await llm_reply(
+            user_text=prompt,
+            system_prompt=SYSTEM_PROMPT,
+            context=context,
+        )
+        await msg.answer(reply[:MAX_REPLY_CHARS])
+        self_user = await bot.me()
+        await memory.add_message(chat_id, None, self_user.username if self_user else "assistant", "assistant", reply)
+    except Exception as e:
+        await msg.answer(f"LLM error: `{e}`")
+
+    await maybe_summarize(chat_id)
+
+# ---------- Fallback text handler (mentions / replies) ----------
+@dp.message(F.text & (F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE})))
+async def on_text(msg: Message):
+    chat_id = str(msg.chat.id)
+    user_id = str(msg.from_user.id) if msg.from_user else None
+    username = msg.from_user.username if msg.from_user else None
+    text = (msg.text or "").strip()
+
+    # Store all messages
+    await memory.add_message(chat_id, user_id, username, "user", text)
+
+    # Decide whether to reply automatically
+    self_user = await bot.me()
+    is_private = msg.chat.type == ChatType.PRIVATE
+
+    mentioned = False
+    if msg.entities:
+        for e in msg.entities:
+            if getattr(e, "type", None) == MessageEntityType.MENTION:
+                mentioned = True
+                break
+    if self_user and (f"@{self_user.username}" in text):
+        mentioned = True
+
+    is_reply_to_me = (
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and self_user
+        and msg.reply_to_message.from_user.id == self_user.id
+    )
+
+    should_reply = is_private or mentioned or is_reply_to_me
+    if not should_reply:
+        return
+
+    context = await build_context(chat_id)
+    try:
+        reply = await llm_reply(
+            user_text=text,
+            system_prompt=SYSTEM_PROMPT,
+            context=context,
+        )
+        await msg.answer(reply[:MAX_REPLY_CHARS])
+        await memory.add_message(chat_id, None, self_user.username if self_user else "assistant", "assistant", reply)
+    except Exception as e:
+        await msg.answer(f"LLM error: `{e}`")
+
+    await maybe_summarize(chat_id)
+
+# ---------- Entry ----------
+async def main():
+    await memory.init()
+    print("Bot is running (polling).")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
