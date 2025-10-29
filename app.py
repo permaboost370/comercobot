@@ -48,17 +48,32 @@ dp.include_router(router)
 # -----------------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-async def ask_llm(prompt: str) -> str:
-    """Call OpenAI Responses API and return plain text output."""
+# System prompt to make the bot a top agronomist / γεωπόνος
+SYSTEM_PROMPT = (
+    "You are an elite agronomist (γεωπόνος) and crop specialist. "
+    "You have deep expertise across field crops, orchards, vineyards, vegetables, greenhouses, hydroponics, and specialty crops. "
+    "You are an expert in plant nutrition & fertilization (macro/micro nutrients, deficiency symptoms, tissue/soil tests), "
+    "irrigation scheduling, soil science, IPM (integrated pest management), and the diagnosis and control of diseases & pests. "
+    "Give accurate, practical, step-by-step guidance. When relevant, include ranges, rates, timings, phenological stages, thresholds, "
+    "and scouting/monitoring methods. Prefer active substances and IPM strategies over brand names. "
+    "Flag regulatory/safety constraints and advise consulting local regulations/labels. "
+    "Default to Greek in your answers unless the user clearly asks for English."
+)
+
+async def ask_llm(user_prompt: str) -> str:
+    """Call OpenAI Responses API and return plain text output with agronomist persona."""
     try:
         resp = client.responses.create(
             model=OPENAI_MODEL,
-            input=f"You are a concise assistant. Answer clearly.\n\nUser: {prompt}",
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
         )
         return resp.output_text.strip()
     except Exception as e:
         log.exception("OpenAI error")
-        return f"⚠️ AI error: {e}"
+        return f"⚠️ Σφάλμα AI: {e}"
 
 # -----------------------------
 # Handlers
@@ -67,15 +82,17 @@ async def ask_llm(prompt: str) -> str:
 async def on_start_cmd(message: Message):
     log.info(f"/start from {message.from_user.id} @{message.from_user.username}")
     await message.answer(
-        "👋 Hi! Send <code>/ai your question</code> and I'll reply.\n"
-        "Example: <code>/ai best pizza dough recipe?</code>"
+        "👋 Καλώς ήρθες! Είμαι ο γεωπόνος σου.\n"
+        "Στείλε <code>/ai την ερώτησή σου</code> και θα απαντήσω.\n"
+        "Παράδειγμα: <code>/ai Πρόγραμμα λίπανσης για ντομάτα θερμοκηπίου;</code>"
     )
 
 @router.message(Command("ai"))
 async def on_ai(message: Message, command: CommandObject):
     if not command.args:
         await message.reply(
-            "Please provide a prompt. Example: <code>/ai what is a closure in Python?</code>"
+            "Δώσε ερώτημα μετά την εντολή. Παράδειγμα: "
+            "<code>/ai Συμπτώματα έλλειψης μαγνησίου στην ελιά;</code>"
         )
         return
     await message.chat.do("typing")
